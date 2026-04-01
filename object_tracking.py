@@ -1,4 +1,4 @@
-import fg_camera_sim
+# import fg_camera_sim  # Commented out to prevent X11 DisplayConnectionError when not in use
 import cv2
 import pyrealsense2.pyrealsense2 as rs
 import numpy as np
@@ -56,11 +56,11 @@ def create_tracker(tracker_type='CSRT'):
 def load_visdrone_network():
 
     global visdrone_net, output_layers, visdrone_classes
-    # TODO: be sure to set these paths correctly, according to your system.
-    in_weights = '/home/usafa/PycharmProjects/USAFA/Drone001/yolo_visdron/yolov4-tiny-custom_last.weights'
-    in_config = '/home/usafa/PycharmProjects/USAFA/Drone001/yolo_visdron/yolov4-tiny-custom.cfg'
-    name_file = '/home/usafa/PycharmProjects/USAFA/Drone001/yolo_visdron/custom.names'
-
+    
+    # Updated paths to match the current working directory structure
+    in_weights = '/home/usafa/Desktop/student_pex03_oop/yolo_visdrone/yolov4-tiny-custom_last.weights'
+    in_config = '/home/usafa/Desktop/student_pex03_oop/yolo_visdrone/yolov4-tiny-custom.cfg'
+    name_file = '/home/usafa/Desktop/student_pex03_oop/yolo_visdrone/custom.names'
 
     """
     load names

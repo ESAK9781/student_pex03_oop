@@ -129,7 +129,7 @@ class DroneMission:
         self.target_radius = target_radius
         self.target_multiplier = target_multiplier
         self.image_log_rate = image_log_rate
-        self.log_path = log_write_import fg_camera_simpath
+        self.log_path = log_write_path
         self.max_confirm_attempts = max_confirm_attempts
         self.target_radius = min_target_radius
 
