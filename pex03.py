@@ -41,16 +41,18 @@ class SITLDashboard:
     def __init__(self, drone, mission_controller):
         self.drone = drone
         self.mission = mission_controller
-        self.width = 450
-        self.height = 350
+        self.width = 500
+        self.height = 450
         self.window_name = "SITL Control Panel"
+        self.camera_connected = False
         
         cv2.namedWindow(self.window_name)
         cv2.setMouseCallback(self.window_name, self.click_event)
 
         # Button bounding boxes: (x1, y1, x2, y2)
-        self.btn_rtl = (20, 280, 200, 330)
-        self.btn_land = (230, 280, 430, 330)
+        # Shifted down to make room for simulation instructions
+        self.btn_rtl = (20, 370, 200, 420)
+        self.btn_land = (230, 370, 430, 420)
 
     def click_event(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -73,7 +75,7 @@ class SITLDashboard:
 
         # --- Telemetry Data ---
         cv2.putText(img, "PEX 03 SITL DASHBOARD", (20, 30), cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
-        cv2.line(img, (20, 40), (430, 40), (100, 100, 100), 2)
+        cv2.line(img, (20, 40), (480, 40), (100, 100, 100), 2)
 
         mode_color = (0, 255, 0) if self.drone.mode.name in ["AUTO", "GUIDED"] else (0, 165, 255)
         cv2.putText(img, f"Drone Mode: {self.drone.mode.name}", (20, 75), IMG_FONT, 0.6, mode_color, 1)
@@ -83,10 +85,20 @@ class SITLDashboard:
         # --- Mission State ---
         state_map = {0: "SEEK", 1: "CONFIRM", 2: "TARGET", 4: "DELIVER", 8: "RTL/DONE"}
         current_state = state_map.get(self.mission.mission_mode, "UNKNOWN")
-        cv2.putText(img, f"Mission State: {current_state}", (20, 180), IMG_FONT, 0.7, (255, 200, 0), 2)
+        cv2.putText(img, f"Mission State: {current_state}", (20, 175), IMG_FONT, 0.7, (255, 200, 0), 2)
         
         tgt_color = (0, 255, 0) if self.mission.object_identified else (0, 0, 255)
-        cv2.putText(img, f"Target Acquired: {self.mission.object_identified}", (20, 215), IMG_FONT, 0.6, tgt_color, 1)
+        cv2.putText(img, f"Target Acquired: {self.mission.object_identified}", (20, 205), IMG_FONT, 0.6, tgt_color, 1)
+
+        cam_color = (0, 255, 0) if self.camera_connected else (0, 0, 255)
+        cam_text = "CONNECTED" if self.camera_connected else "NOT DETECTED! PLEASE CONNECT CAMERA."
+        cv2.putText(img, f"Camera Status: {cam_text}", (20, 235), IMG_FONT, 0.5, cam_color, 1)
+
+        # --- Simulation Steps ---
+        cv2.putText(img, "--- SIMULATION SETUP STEPS ---", (20, 265), IMG_FONT, 0.5, (255, 255, 0), 1)
+        cv2.putText(img, "1. Launch SITL / FlightGear Environment", (20, 285), IMG_FONT, 0.5, (200, 200, 200), 1)
+        cv2.putText(img, "2. Verify RealSense Camera Feed is tracking", (20, 310), IMG_FONT, 0.5, (200, 200, 200), 1)
+        cv2.putText(img, "3. Auto-mission starts upon drone arming", (20, 335), IMG_FONT, 0.5, (200, 200, 200), 1)
 
         # --- Buttons ---
         cv2.rectangle(img, (self.btn_rtl[0], self.btn_rtl[1]), (self.btn_rtl[2], self.btn_rtl[3]), (0, 100, 200), -1)
@@ -117,7 +129,7 @@ class DroneMission:
         self.target_radius = target_radius
         self.target_multiplier = target_multiplier
         self.image_log_rate = image_log_rate
-        self.log_path = log_write_path
+        self.log_path = log_write_import fg_camera_simpath
         self.max_confirm_attempts = max_confirm_attempts
         self.target_radius = min_target_radius
 
@@ -140,7 +152,7 @@ class DroneMission:
         self.last_alt_pos = -1.0
         self.last_heading_pos = -1.0
 
-        # Initialize UI if in Virtual Mode
+        # Initialize UI only if in Virtual/Testing Mode
         self.dashboard = SITLDashboard(self.drone, self) if self.virtual_mode else None
 
     @staticmethod
@@ -305,7 +317,16 @@ class DroneMission:
 
             timer = cv2.getTickCount()
             frame = obj_track.get_cur_frame()
-            if frame is None: continue
+            
+            # --- Update the SITL UI Dashboard if Active ---
+            if self.virtual_mode and self.dashboard:
+                self.dashboard.camera_connected = (frame is not None)
+                self.dashboard.update_and_draw()
+
+            if frame is None:
+                if self.virtual_mode:
+                    if cv2.waitKey(1) & 0xFF == ord("q"): break
+                continue
 
             location = self.drone.location.global_relative_frame
             self.last_lat_pos, self.last_lon_pos, self.last_alt_pos = location.lat, location.lon, location.alt
@@ -330,9 +351,6 @@ class DroneMission:
                 if not confidence:
                     self.object_identified = False
 
-            # --- Update the SITL UI Dashboard if Active ---
-            if self.virtual_mode and self.dashboard:
-                self.dashboard.update_and_draw()
 
             if self.virtual_mode:
                 cv2.imshow("Tracking Feed", frm_display)
@@ -352,7 +370,7 @@ if __name__ == '__main__':
     parser.add_argument('--sitl', action='store_true', help="Run the mission in Virtual SITL Mode with GUI")
     args = parser.parse_args()
     
-    IS_VIRTUAL = IS_IN_SITL
+    IS_VIRTUAL = args.sitl if args.sitl else IS_IN_SITL
 
     pex03_utils.backup_prev_experiment(IMG_SNAPSHOT_PATH)
     log_file = time.strftime(IMG_SNAPSHOT_PATH + "/Cam_PEX03_%Y%m%d-%H%M%S") + ".log"

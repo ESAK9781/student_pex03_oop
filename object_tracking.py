@@ -1,3 +1,4 @@
+import fg_camera_sim
 import cv2
 import pyrealsense2.pyrealsense2 as rs
 import numpy as np
