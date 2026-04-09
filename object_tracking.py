@@ -7,7 +7,7 @@ import numpy as np
 output_layers = None
 visdrone_net = None
 visdrone_classes = []
-CONF_THRESH, NMS_THRESH = 0.05, 0.5
+CONF_THRESH, NMS_THRESH = 0.17, 0.17
 
 # Configure realsense camera stream
 pipeline = rs.pipeline()
@@ -22,7 +22,7 @@ FRAME_WIDTH = int(640)
 rnd_background = np.random.randint(0, 256, size=(FRAME_HEIGHT, FRAME_WIDTH, 3)).astype('uint8')
 
 total_track_misses = 0
-TRACKER_MISSES_MAX = 6
+TRACKER_MISSES_MAX = 140
 confirmed_object_tracking = False
 
 tracker = None
@@ -121,7 +121,7 @@ def confirm_obj_in_bbox(frame, bbox, frame_write=None, show_img=False, in_debug=
 
         # Return whether or not the object was confirmed.
         if confidence is not None \
-                and confidence > .2:
+                and confidence > CONF_THRESH:
             return True
         else:
             return False
@@ -305,7 +305,7 @@ def start_camera_stream():
 
     # Keep in mind that we are using BGR ordering because
     # it works natively with openCV..
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 60)
     pipeline.start(config)
 
     profile = pipeline.get_active_profile()
@@ -384,9 +384,9 @@ if __name__ == '__main__':
         if not object_identified:
             center, confidence, (x, y), radius, frm_display, bbox \
                 = check_for_initial_target(frame, frm_display,
-                                           in_debug=False, show_img=True)
+                                           in_debug=True, show_img=True)
             if confidence is not None \
-                    and confidence > .2:
+                    and confidence > CONF_THRESH:
                 # Initialize tracker with first frame and bounding box
                 # bbox needs: xb,yb,wb,hb
                 object_identified = True
