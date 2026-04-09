@@ -29,6 +29,7 @@ import cv2
 import random
 import sys
 import traceback
+import math
 
 import drone_lib
 import object_tracking_y8_histo as obj_track
@@ -75,6 +76,12 @@ MISSION_MODE_RTL     = 8   # Delivery done (or aborted); returning home
 # Font for cv2 text annotations
 IMG_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+CONFIRMATION_CONFIDENCE_LEVEL = 0.4
+SLOWER_DESCENT_ALTITUDE_THRESHOLD = 7.5 # in meters
+SLOW_DESCENT_VELOCITY = 0.5 # m/s
+FAST_DESCENT_VELOCITY = 1.0 # m/s
+DROPZONE_APPROACH_VELOCITY = 0.5 # m/s
+
 
 # =============================================================================
 # DroneMission CLASS
@@ -82,26 +89,26 @@ IMG_FONT = cv2.FONT_HERSHEY_SIMPLEX
 class DroneMission:
     """
     Encapsulates the autonomous delivery mission for one drone.
-
+ 
     The entire mission is driven by conduct_mission().  All state transitions
     happen in that single method so the flow is always readable in one place.
-
+ 
     Helper methods (adjust_to_target_center, deliver_package) perform the
     *work* of a state and return True/False to indicate completion — they
     never modify self.mission_mode directly.
-
+ 
     Parameters
     ----------
     device : DroneKit vehicle object returned by drone_lib.connect_device().
     config : MissionConfig instance loaded from pex03_config.json.
     """
-
+ 
     def __init__(self, device, config: MissionConfig):
-
+ 
         # ── Core references ───────────────────────────────────────────────────
         self.drone  = device
         self.config = config
-
+ 
         # ── Configuration shortcuts ───────────────────────────────────────────
         # Pull frequently-used values out of config so the code below reads
         # cleanly without long chains of self.config.xxx everywhere.
@@ -111,7 +118,7 @@ class DroneMission:
         self.image_log_rate         = config.image_log_rate
         self.log_path               = config.mission_log_path
         self.max_confirm_attempts   = config.max_confirm_attempts
-
+ 
         # ── State machine ─────────────────────────────────────────────────────
         self.mission_mode       = MISSION_MODE_SEEK
         self.refresh_counter    = 0
@@ -120,7 +127,7 @@ class DroneMission:
         self.inside_circle      = False
         self.direction_x        = "unknown"
         self.direction_y        = "unknown"
-
+ 
         # ── Initial sighting record ───────────────────────────────────────────
         # GPS position where the drone first spotted a candidate target.
         # Used to fly back for confirmation.
@@ -128,7 +135,7 @@ class DroneMission:
         self.init_obj_lon     = None
         self.init_obj_alt     = None
         self.init_obj_heading = None
-
+ 
         # ── Last GPS snapshot ─────────────────────────────────────────────────
         # Updated every frame — records where the drone was at the exact
         # moment the corresponding camera frame was captured.
@@ -136,36 +143,36 @@ class DroneMission:
         self.last_lon_pos     = -1.0
         self.last_alt_pos     = -1.0
         self.last_heading_pos = -1.0
-
+ 
     # =========================================================================
     # UTILITY METHODS
     # =========================================================================
-
+ 
     @staticmethod
     def log_info(msg):
         """Write a message to the mission log."""
         log.info(msg)
-
+ 
     def arm_drone(self):
         """Arm the drone (convenience wrapper)."""
         drone_lib.arm_device(self.drone)
-
+ 
     # =========================================================================
     # GEOMETRY HELPERS
     # These methods answer spatial questions about the target's position
     # relative to the drone's camera.  They do not issue flight commands.
     # =========================================================================
-
+ 
     def target_is_centered(self, target_point, frame_write=None):
         """
         Check whether the target is inside the acceptance circle and annotate
         the display frame with alignment indicators.
-
+ 
         Parameters
         ----------
         target_point : (cx, cy) pixel coordinates of the target's centre.
         frame_write  : Display frame to annotate (optional).
-
+ 
         Returns
         -------
         bool : True if the target is inside the acceptance zone.
@@ -173,7 +180,7 @@ class DroneMission:
         dx = float(target_point[0]) - obj_track.FRAME_HORIZONTAL_CENTER
         dy = obj_track.FRAME_VERTICAL_CENTER - float(target_point[1])
         self.log_info(f"Alignment — dx={dx:.1f} px, dy={dy:.1f} px")
-
+ 
         x, y = target_point
         if frame_write is not None:
             # Red line: target centre → frame centre (shows offset visually)
@@ -189,9 +196,9 @@ class DroneMission:
                        int(self.target_radius * 1.5), (255, 255, 0), 2)
             # Cyan dot at target centre
             cv2.circle(frame_write, target_point, 5, (0, 255, 255), -1)
-
+ 
         return self.check_in_circle(target_point)
-
+ 
     def check_in_circle(self, target_point):
         """
         Return True if target_point is within self.target_radius pixels of
@@ -202,22 +209,22 @@ class DroneMission:
             + (int(target_point[1]) - obj_track.FRAME_VERTICAL_CENTER) ** 2
             <= self.target_radius ** 2
         )
-
+ 
     # =========================================================================
     # STATE WORKER METHODS
     # These methods do the *work* of a state.
     # IMPORTANT: None of them change self.mission_mode.
     #            ALL transitions happen in conduct_mission() only.
     # =========================================================================
-
+ 
     def adjust_to_target_center(self, target_point, frame_write=None):
         """
         Issue small corrective velocity commands to centre the drone over
         the target.
-
+ 
         Returns True when centered (signals conduct_mission() to transition
         to DELIVER).  Returns False while still maneuvering.
-
+ 
         Parameters
         ----------
         target_point : (cx, cy) pixel coordinates of the tracked target.
@@ -230,23 +237,34 @@ class DroneMission:
         # dy < 0 → target BELOW  → drone moves BACKWARD
         dx = float(target_point[0]) - obj_track.FRAME_HORIZONTAL_CENTER
         dy = obj_track.FRAME_VERTICAL_CENTER - float(target_point[1])
-
-        # TODO: Decide how many pixels of offset are acceptable before
-        #       issuing a correction command.  Consider: at mission altitude,
-        #       how many metres does 1 pixel of offset represent?
-        pixel_forgiveness = 1   # pixels — TODO: adjust this value!
-
+ 
+        # 1. Get physical constants from config
+        h = self.config.takeoff_altitude_m
+        theta_v = math.radians(self.config.camera_fov_v_deg)
+        H = self.config.camera_resolution_height 
+ 
+        # 2. Calculate meters per pixel (Vertical)
+        # This tells you how many meters 1 pixel represents on the ground.
+        m_per_px = (2 * h * math.tan(theta_v / 2)) / H
+ 
+        # 3. Define your physical deadzone (e.g., 0.5 meters)
+        # Within 0.5m of center is considered "centered enough" to stop moving.
+        physical_deadzone_m = 0.5  # TWEAK TO CENTER MORE IF NEEDED
+ 
+        # 4. Set pixel_forgiveness
+        pixel_forgiveness = physical_deadzone_m / m_per_px
+ 
         self.direction_x = "C"
         self.direction_y = "C"
-
+ 
         if abs(dx) > pixel_forgiveness:
             self.direction_x = "R" if dx > 0 else "L"
         if abs(dy) > pixel_forgiveness:
             self.direction_y = "F" if dy > 0 else "B"
-
+ 
         self.log_info(f"Targeting — dx={dx:.1f}, dy={dy:.1f} | "
                       f"dir_x={self.direction_x}, dir_y={self.direction_y}")
-
+ 
         # centered on both axes (or already inside the acceptance circle)?
         # Return True to signal conduct_mission() to begin delivery.
         if (self.direction_x == "C" and self.direction_y == "C") \
@@ -256,87 +274,68 @@ class DroneMission:
                 cv2.putText(frame_write, "On target — delivering!",
                             (10, 400), IMG_FONT, 1, (0, 0, 255), 2, cv2.LINE_AA)
             return True
-
+ 
         # ── Still off-centre: issue velocity corrections ──────────────────────
-
-        # TODO: Choose a pixel-distance threshold.  When the offset is LARGER
+ 
+        #       Choose a pixel-distance threshold.  When the offset is LARGER
         #       than this, use a faster correction velocity to close the gap
         #       quickly.  When the offset is smaller, use a slower velocity
         #       to avoid overshooting the target.
-        pixel_distance_threshold = -1   # TODO: set a sensible value!
-
+        pixel_distance_threshold = 2.5 / m_per_px
+ 
+        # Fast velocity for large offsets
+        fast_v = 0.5
+        # Slow velocity for fine-tuning near center
+        # Must be small enough to stay within pixel_forgiveness in a 1s block
+        slow_v = 0.2
+ 
         # ── Y-axis (forward / backward) ───────────────────────────────────────
         if self.direction_y != "C":
+            # Determine y-velocity (yv) based on error magnitude
+            yv = fast_v if abs(dy) > pixel_distance_threshold else slow_v
+            
             if self.direction_y == "F":
                 if frame_write is not None:
-                    cv2.putText(frame_write, "Moving forward...",
+                    cv2.putText(frame_write, f"Moving forward ({yv}m/s)...",
                                 (10, 200), IMG_FONT, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                if abs(dy) > pixel_distance_threshold:
-                    # TODO: Set a forward velocity (yv) for large offsets.
-                    # yv = ???
-                    pass   # TODO: remove once yv is set
-                else:
-                    # TODO: Set a slower forward velocity (yv) for fine tuning.
-                    # yv = ???
-                    pass   # TODO: remove once yv is set
-                # TODO: drone_lib.small_move_forward(self.drone, velocity=yv)
-                #   or: drone_lib.move_local(self.drone, yv, 0, 0.0)
-                pass   # TODO: remove once move command is added
+                drone_lib.small_move_forward(self.drone, velocity=yv)
             else:
                 if frame_write is not None:
-                    cv2.putText(frame_write, "Moving backward...",
+                    cv2.putText(frame_write, f"Moving backward ({yv}m/s)...",
                                 (10, 200), IMG_FONT, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                if abs(dy) > pixel_distance_threshold:
-                    # TODO: yv = ???
-                    pass
-                else:
-                    # TODO: yv = ???
-                    pass
-                # TODO: drone_lib.small_move_back(self.drone, velocity=yv)
-                pass
-
+                drone_lib.small_move_back(self.drone, velocity=yv)
+ 
         # ── X-axis (left / right) ─────────────────────────────────────────────
         if self.direction_x != "C":
+            # Determine x-velocity (xv) based on error magnitude
+            xv = fast_v if abs(dx) > pixel_distance_threshold else slow_v
+            
             if self.direction_x == "R":
                 if frame_write is not None:
-                    cv2.putText(frame_write, "Moving right...",
+                    cv2.putText(frame_write, f"Moving right ({xv}m/s)...",
                                 (10, 300), IMG_FONT, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                if abs(dx) > pixel_distance_threshold:
-                    # TODO: xv = ???
-                    pass
-                else:
-                    # TODO: xv = ???
-                    pass
-                # TODO: drone_lib.small_move_right(self.drone, velocity=xv)
-                pass
+                drone_lib.small_move_right(self.drone, velocity=xv)
             else:
                 if frame_write is not None:
-                    cv2.putText(frame_write, "Moving left...",
+                    cv2.putText(frame_write, f"Moving left ({xv}m/s)...",
                                 (10, 300), IMG_FONT, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                if abs(dx) > pixel_distance_threshold:
-                    # TODO: xv = ???
-                    pass
-                else:
-                    # TODO: xv = ???
-                    pass
-                # TODO: drone_lib.small_move_left(self.drone, velocity=xv)
-                pass
-
+                drone_lib.small_move_left(self.drone, velocity=xv)
+ 
         return False   # still adjusting
-
+ 
     def deliver_package(self, target_center, frame_write=None):
         """
         Calculate the drop point, fly there, lower the package, and release it.
-
+ 
         When this method returns, conduct_mission() transitions to RTL.
-
+ 
         Distance to the target is determined by one of two methods depending
         on config.use_estimated_distance:
-
+ 
           True  → estimate_ground_distance_m() uses camera geometry
                   (pixel row + tilt angle + altitude).  No rangefinder needed.
           False → get_avg_distance_to_obj() reads the rangefinder sensor.
-
+ 
         Parameters
         ----------
         target_center : (cx, cy) pixel coordinates of the tracked target.
@@ -344,13 +343,13 @@ class DroneMission:
         frame_write   : Display frame to annotate with delivery status.
         """
         self.log_info("Deliver: beginning delivery sequence...")
-
+ 
         location = self.drone.location.global_relative_frame
         lon      = location.lon
         lat      = location.lat
         alt      = location.alt
         heading  = self.drone.heading
-
+ 
         # ── Step 1: Measure distance to target ────────────────────────────────
         if self.config.use_estimated_distance:
             # Camera-geometry estimation — no rangefinder required.
@@ -370,7 +369,7 @@ class DroneMission:
             self.log_info(f"Deliver: estimated ground distance = {ground_dist:.2f} m "
                           f"(tilt source: {self.config.tilt_source}, "
                           f"tilt used: {self.config.effective_camera_tilt_deg:.1f}°)")
-
+ 
         else:
             # Rangefinder path — hardware sensor required.
             # get_avg_distance_to_obj() averages readings over several seconds
@@ -380,18 +379,22 @@ class DroneMission:
                 5.0, self.drone, self.virtual_mode)
             self.log_info(f"Deliver: slant distance (hypotenuse) = {slant_dist:.2f} m, "
                           f"altitude = {alt:.2f} m")
-
+ 
             if slant_dist <= 0:
                 self.log_info("Deliver: invalid rangefinder reading — aborting delivery.")
                 return
-
+ 
             # Convert slant distance + altitude to horizontal ground distance.
             # Pythagoras:  ground² = slant² − altitude²
-            # TODO: Use pex03_utils.get_ground_distance() to calculate this.
-            # HINT: ground_dist = pex03_utils.get_ground_distance(alt, slant_dist)
-            ground_dist = 0   # TODO: replace this!
+ 
+            self.log_info("Deliver: reading slant distance from rangefinder...")
+            slant_dist = pex03_utils.get_avg_distance_to_obj(5.0, self.drone, self.virtual_mode)
+            self.log_info(f"Deliver: slant distance (hypotenuse) = {slant_dist:.2f} m, "
+                          f"altitude = {alt:.2f} m")
+            
+            ground_dist = pex03_utils.get_ground_distance()
             self.log_info(f"Deliver: ground distance = {ground_dist:.2f} m")
-
+ 
         # Guard: if the distance estimate is invalid, abort.
         if ground_dist <= 0:
             self.log_info("Deliver: ground distance is invalid — aborting delivery.")
@@ -408,17 +411,18 @@ class DroneMission:
         self.log_info(f"Deliver: current position = lat={lat:.6f}, lon={lon:.6f}, "
                       f"heading={heading:.1f}°")
 
-        # TODO: Use pex03_utils.calc_new_location() to compute the drop coords.
+        # Use pex03_utils.calc_new_location() to compute the drop coords.
         # HINT: new_lat, new_lon = pex03_utils.calc_new_location(
         #           lat, lon, heading, ground_dist)
-        new_lat = 0.0   # TODO: replace this!
-        new_lon = 0.0   # TODO: replace this!
+
+        new_lat, new_lon = pex03_utils.calc_new_location(lat, lon, heading, ground_dist)
+
         self.log_info(f"Deliver: drop point = lat={new_lat:.6f}, lon={new_lon:.6f}")
 
         # ── Step 3: Fly to the drop point ─────────────────────────────────────
-        # TODO: Command the drone to fly to the drop coordinates.
+        #  Command the drone to fly to the drop coordinates.
         # HINT: drone_lib.goto_point(self.drone, new_lat, new_lon, speed, alt)
-        pass   # TODO: remove once goto_point() is called
+        drone_lib.goto_point(self.drone, new_lat, new_lon, DROPZONE_APPROACH_VELOCITY, alt)
 
         if frame_write is not None:
             cv2.putText(frame_write, "Delivering...",
@@ -435,9 +439,9 @@ class DroneMission:
             # Two-phase descent: fast until near the ground, then slow/fine
             # for the final approach before releasing the package.
 
-            # TODO: Set the altitude boundary between the fast and slow phases.
+            #  Set the altitude boundary between the fast and slow phases.
             #       At what height does a fast descent become unsafe?
-            alt_thresh = -1   # TODO: set a sensible altitude (metres)!
+            alt_thresh = SLOWER_DESCENT_ALTITUDE_THRESHOLD
 
             self.log_info("Deliver: lowering package (fast descent)...")
             while self.drone.location.global_relative_frame.alt > alt_thresh:
@@ -445,8 +449,7 @@ class DroneMission:
                         or self.mission_mode == MISSION_MODE_RTL):
                     self.log_info("Deliver: abort signal — stopping descent.")
                     break
-                # TODO: drone_lib.small_move_down(self.drone, velocity=<fast>)
-                pass   # TODO: remove once descent command is added
+                drone_lib.small_move_down(self.drone, velocity=FAST_DESCENT_VELOCITY)
 
             self.log_info("Deliver: switching to slow/fine descent...")
             while self.drone.location.global_relative_frame.alt > 3.20:
@@ -454,12 +457,13 @@ class DroneMission:
                         or self.mission_mode == MISSION_MODE_RTL):
                     self.log_info("Deliver: abort signal — stopping fine descent.")
                     break
-                # TODO: drone_lib.small_move_down(self.drone, velocity=<slow>)
-                pass   # TODO: remove once descent command is added
+               
+                drone_lib.small_move_down(self.drone, velocity=SLOW_DESCENT_VELOCITY)
 
         # ── Step 5: Release the package ───────────────────────────────────────
-        # TODO: Call pex03_utils.release_grip() to open the latch.
-        # HINT: pex03_utils.release_grip(self.drone, seconds=2)
+        # Call pex03_utils.release_grip() to open the latch.
+
+        pex03_utils.release_grip(self.drone, seconds=2)
         self.log_info("Deliver: releasing package...")
         time.sleep(2)   # brief pause to ensure the latch has fully opened
 
@@ -518,9 +522,9 @@ class DroneMission:
             # The camera runs in a background thread (cam_handler), so this
             # returns immediately with the latest available frame.
             #
-            # TODO: Get the current camera frame from the tracker module.
+            # Get the current camera frame from the tracker module.
             # HINT: frame = obj_track.get_cur_frame()
-            frame = None   # TODO: replace this!
+            frame = obj_track.get_cur_frame()
 
             if frame is None:
                 continue   # camera not ready yet — skip this iteration
@@ -533,12 +537,15 @@ class DroneMission:
             # drone WAS at that moment so we can fly back to confirm.
             location = self.drone.location.global_relative_frame
 
-            # TODO: Update self.last_lat_pos, self.last_lon_pos, self.last_alt_pos
+            # Update self.last_lat_pos, self.last_lon_pos, self.last_alt_pos
             #       from the location object so we always have a current record.
             # HINT: self.last_lat_pos = location.lat
             #       self.last_lon_pos = location.lon
             #       self.last_alt_pos = location.alt
             self.last_heading_pos = self.drone.heading
+            self.last_lat_pos = location.lat
+            self.last_lon_pos = location.lon
+            self.last_alt_pos = location.alt
 
             # Annotate a copy of the frame so the original stays clean for
             # the tracker's histogram computation.
@@ -575,12 +582,12 @@ class DroneMission:
                             frame, frm_display,
                             show_img=self.virtual_mode)
 
-                    # TODO: Set the detection confidence threshold.
+                    # Set the detection confidence threshold.
                     #       Too HIGH → miss real targets.
                     #       Too LOW  → waste time on false positives.
                     # HINT: The model's raw confidence rarely reaches 0.99 —
                     #       a value in the 0.3–0.6 range is more realistic.
-                    conf_level = 0.99   # TODO: adjust this value!
+                    conf_level = CONFIRMATION_CONFIDENCE_LEVEL
 
                     if confidence is not None and confidence > conf_level:
 
@@ -593,9 +600,10 @@ class DroneMission:
 
                         # Lock the histogram tracker so we can re-identify
                         # the same person after maneuvering back.
-                        # TODO: Lock the tracker onto this detection.
+                        # Lock the tracker onto this detection.
                         # HINT: obj_track.set_object_to_track(frame, bbox)
                         self.object_identified = True
+                        obj_track.set_object_to_track(frame, bbox)
 
                         # Record where the candidate was first seen.
                         self.init_obj_lat     = location.lat
@@ -734,9 +742,8 @@ class DroneMission:
                               "Commanding return-to-launch.")
                 self.mission_mode = MISSION_MODE_RTL
 
-                # TODO: Command the drone to return home.
                 # HINT: drone_lib.return_to_launch(self.drone)
-                pass   # TODO: remove once return_to_launch() is called
+                drone_lib.return_to_launch(self.drone)
 
             # -----------------------------------------------------------------
             # STATE: RTL
